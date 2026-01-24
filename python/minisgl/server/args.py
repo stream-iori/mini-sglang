@@ -111,7 +111,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="The fraction of GPU memory to use for KV cache.",
     )
 
-    assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",
         action="store_true",
@@ -119,11 +118,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Use dummy weights for testing.",
     )
 
-    assert ServerArgs.use_pynccl == True
     parser.add_argument(
         "--disable-pynccl",
         action="store_false",
         dest="use_pynccl",
+        default=True,
         help="Disable PyNCCL for tensor parallelism.",
     )
 

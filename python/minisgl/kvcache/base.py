@@ -10,8 +10,8 @@ import torch
 
 class BaseKVCache(ABC):
     """
-    Base class for key-value caches.
-    This class defines the interface for key-value caches used.
+    Key-Value Cache 基类。
+    定义了 KV Cache 的物理存储接口。
     """
 
     @abstractmethod
@@ -23,7 +23,9 @@ class BaseKVCache(ABC):
     @abstractmethod
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
-    ) -> None: ...
+    ) -> None: 
+        """将计算出的 K/V 写入 Cache"""
+        ...
 
     @property
     @abstractmethod
@@ -39,18 +41,20 @@ class BaseKVCache(ABC):
 
 
 class KVCacheLayout(enum.Enum):
-    LayerFirst = enum.auto()
-    PageFirst = enum.auto()
+    """Cache 内存布局"""
+    LayerFirst = enum.auto() # [layers, ...]
+    PageFirst = enum.auto()  # [pages, ...]
 
 
 @dataclass(frozen=True)
 class BaseCacheHandle(ABC):
+    """Cache 句柄基类"""
     cached_len: int
 
 
 class SizeInfo(NamedTuple):
-    evictable_size: int
-    protected_size: int
+    evictable_size: int  # 可被驱逐的大小 (空闲或LRU)
+    protected_size: int  # 受保护的大小 (正在使用)
 
     @property
     def total_size(self) -> int:
@@ -58,73 +62,63 @@ class SizeInfo(NamedTuple):
 
 
 class BaseCacheManager(ABC):
+    """
+    KV Cache 管理器基类。
+    定义了逻辑上的 Cache 管理接口 (分配、释放、查找)。
+    """
     @abstractmethod
     def match_prefix(self, input_ids: torch.Tensor) -> Tuple[BaseCacheHandle, torch.Tensor]:
         """
-        Match prefix and return the indices of the matched prefix in the cache.
-        This operation will not modify the cache.
-        The returned indices is only safe to use when the handle is locked.
+        匹配输入序列的前缀。
+        不修改 Cache 状态。
+        在使用返回的 indices 之前必须锁定 handle。
 
         Args:
-            input_ids (torch.Tensor): The input ids to match. Shape: (seq_len,)
+            input_ids (torch.Tensor): 输入 Token IDs
         Returns:
-            handle (BaseCacheHandle): The handle to the matched prefix.
-            indices (torch.Tensor): The indices of the longest-matched prefix in the cache.
+            handle: Cache 句柄
+            indices: 匹配到的物理索引
         """
 
     @abstractmethod
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         """
-        Lock or unlock a cache handle.
-        This operation will not modify the cache, but change the size info only.
-        When a handle is locked, it cannot be evicted.
-        Handles must be locked before the previously-returned tensor of `match_prefix` is used.
-        Otherwise it may be evicted by calling evict.
-
-        Args:
-            handle (BaseCacheHandle): The cache handle to lock or unlock.
-            unlock (bool): Whether to unlock the handle. Defaults to False.
+        锁定或解锁句柄。
+        锁定后的句柄对应的数据不能被驱逐。
         """
 
     @abstractmethod
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> int:
         """
-        Insert a new prefix into the cache.
-        This operation will modify the cache.
+        插入新前缀到 Cache 中 (修改状态)。
+        
         Args:
-            input_ids (torch.Tensor): The input ids to insert. Shape: (seq_len,)
-            indices (torch.Tensor): The indices to store the new prefix. Shape: (seq_len,)
-
+            input_ids: Token IDs
+            indices: 对应的物理索引
         Returns:
-            int: The length of prefix that is already in the cache. This part is not
-                 inserted, so the caller should free these indices.
+            int: 已经存在的前缀长度 (这部分不需要插入)
         """
 
     @abstractmethod
     def evict(self, size: int) -> torch.Tensor:
         """
-        Evict some prefixes from the cache to free up space.
-        This operation will modify the cache.
-        Note that evict 0 is always safe and does nothing.
-        Note that the actual evict size may be larger than the requested size.
+        驱逐指定大小的 Cache 以释放空间。
+        
         Args:
-            size (int): The size to evict.
-
+            size: 需要释放的大小
         Returns:
-            torch.Tensor: The indices evicted. Shape: (evict_size,)
-        Raises:
-            RuntimeError: If the requested size is larger than the evictable size.
+            torch.Tensor: 被释放的物理索引
         """
 
     @abstractmethod
     def reset(self) -> None:
-        """Reset the cache manager and the underlying cache."""
+        """重置管理器"""
 
     @property
     @abstractmethod
     def size_info(self) -> SizeInfo:
-        """Get the size information of the cache."""
+        """获取当前容量信息"""
 
     @abstractmethod
     def check_integrity(self) -> None:
-        """Check the integrity of the cache. Raise an error if the cache is corrupted."""
+        """检查内部状态一致性"""

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class DistributedImpl(ABC):
+    """分布式通信实现的抽象基类"""
     @abstractmethod
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor: ...
 
@@ -23,6 +24,9 @@ class DistributedImpl(ABC):
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
+    """
+    基于 PyTorch 原生 `torch.distributed` (NCCL/Gloo) 的通信实现。
+    """
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = dist.get_world_size()
         if tp_size == 1:
@@ -43,6 +47,10 @@ class TorchDistributedImpl(DistributedImpl):
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
+    """
+    基于自定义 PyNCCL 绑定库的通信实现。
+    通常比 PyTorch 原生的更快，或者提供特定的优化。
+    """
     comm: PyNCCLCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -61,12 +69,18 @@ class PyNCCLDistributedImpl(DistributedImpl):
 
 
 class DistributedCommunicator:
+    """
+    分布式通信器管理器。
+    使用插件机制管理当前的通信后端（Torch 或 PyNCCL）。
+    """
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """执行 All-Reduce 操作 (求和)"""
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        """执行 All-Gather 操作 (收集)"""
         return self.plugins[-1].all_gather(x)
 
 
@@ -74,12 +88,18 @@ def enable_pynccl_distributed(
     tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
 ) -> None:
     """
-    Enable PyNCCL-based distributed communication for tensor parallelism.
+    启用 PyNCCL 作为分布式通信后端。
+    
+    Args:
+        tp_info: 分布式信息
+        tp_cpu_group: PyTorch CPU 进程组（用于 bootstrap）
+        max_bytes: 缓冲区最大大小
     """
     if tp_info.size == 1:
         return
     from minisgl.kernel import init_pynccl
 
+    # 初始化 PyNCCL 通信器
     comm = init_pynccl(
         tp_rank=tp_info.rank,
         tp_size=tp_info.size,
@@ -87,11 +107,12 @@ def enable_pynccl_distributed(
         max_size_bytes=max_bytes,
     )
 
+    # 将其添加到插件列表末尾，成为默认实现
     DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
 
 
 def destroy_distributed() -> None:
     """
-    Destroy all the distributed communication plugins.
+    销毁所有分布式通信插件。
     """
     DistributedCommunicator.plugins = []

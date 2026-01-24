@@ -32,24 +32,54 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
+        try:
+            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+            self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
+        except ImportError:
+            self.apply_rope_with_cos_sin_cache_inplace = None
 
     def forward(
         self,
         positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
-        )
-        return query, key
+        if q.device.type == "cpu":
+            # Naive CPU implementation
+            dim = self.rotary_dim
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
+            t = positions.float()
+            freqs = torch.outer(t, inv_freq)
+            # Create cos/sin
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+            
+            # Apply rotary
+            # q: (total_tokens, num_heads, head_dim)
+            def apply_rotary(x, cos, sin):
+                x_rot = x[..., :dim]
+                x_pass = x[..., dim:]
+                
+                x1 = x_rot[..., :dim//2]
+                x2 = x_rot[..., dim//2:]
+                
+                # Standard rotary rotation
+                # [-x2, x1] * sin + [x1, x2] * cos
+                x_rotated = torch.cat((-x2, x1), dim=-1) * sin.unsqueeze(1) + x_rot * cos.unsqueeze(1)
+                
+                return torch.cat((x_rotated, x_pass), dim=-1)
+                
+            return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
+        else:
+            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+
+            self.cos_sin_cache = self.cos_sin_cache.to(q.device)
+            apply_rope_with_cos_sin_cache_inplace(
+                q, k, self.cos_sin_cache, self.is_neox, positions, False
+            )
+            return q, k
 
 
 def _get_rope(

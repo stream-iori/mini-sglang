@@ -24,17 +24,17 @@ classifiers = [
 dependencies = [
     "accelerate",
     "msgpack",
-    "sgl_kernel>=0.3.17.post1",
+    "sgl_kernel>=0.3.17.post1; sys_platform == 'linux'",
     "torch",
     "transformers>=4.56.0,<=4.57.3",
-    "flashinfer-python>=0.5.3",
+    "flashinfer-python>=0.5.3; sys_platform == 'linux'",
     "pyzmq",
     "uvicorn",
     "fastapi",
     "prompt_toolkit",
     "openai",
     "apache-tvm-ffi>=0.1.4",
-    "nvidia-cutlass-dsl==4.3.1",
+    "nvidia-cutlass-dsl==4.3.1; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +47,10 @@ dev = [
     "pre-commit>=3.0.0",
     "ruff>=0.11.0",
     "matplotlib>=3.10.5",
+]
+benchmark = [
+    "tqdm",
+    "pydantic",
 ]
 
 [tool.setuptools]
@@ -136,3 +140,8 @@ module = [
     "datasets.*",
 ]
 ignore_missing_imports = true
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+include = ["python", "benchmark", "tests"]

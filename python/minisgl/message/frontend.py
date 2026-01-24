@@ -8,6 +8,7 @@ from .utils import deserialize_type, serialize_type
 
 @dataclass
 class BaseFrontendMsg:
+    """前端消息基类 (返回给前端的消息)"""
     @staticmethod
     def encoder(msg: BaseFrontendMsg) -> Dict:
         return serialize_type(msg)
@@ -19,11 +20,13 @@ class BaseFrontendMsg:
 
 @dataclass
 class BatchFrontendMsg(BaseFrontendMsg):
+    """批量前端消息"""
     data: List[BaseFrontendMsg]
 
 
 @dataclass
 class UserReply(BaseFrontendMsg):
+    """用户回复消息 (包含生成的文本片段)"""
     uid: int
-    incremental_output: str
-    finished: bool
+    incremental_output: str # 增量输出的文本
+    finished: bool          # 是否生成结束

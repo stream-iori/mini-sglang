@@ -16,6 +16,16 @@ class BaseOP:
     @abstractmethod
     def forward(self, *args: Any, **kwargs: Any) -> Any: ...
 
+    def to(self, device: torch.device):
+        for key, value in self.__dict__.items():
+            if isinstance(value, BaseOP):
+                value.to(device)
+            elif isinstance(value, torch.Tensor):
+                self.__dict__[key] = value.to(device)
+            elif isinstance(value, torch.nn.Parameter):
+                self.__dict__[key] = value.to(device)
+        return self
+
     def state_dict(self, *, prefix: str = "", result: _STATE_DICT | None = None) -> _STATE_DICT:
         result = result if result is not None else {}
 
