@@ -13,15 +13,26 @@ from .base import BaseCacheHandle, BaseCacheManager, SizeInfo
 class RadixTreeNode:
     """
     Radix Tree (基数树/前缀树) 节点。
-    用于高效存储和检索 Token 序列的前缀。
-    每个节点代表一段 Token 序列片段。
+    
+    设计目的：
+    高效存储和检索 Token 序列的前缀，实现 Shared Prefix Caching。
+    不同于普通的 Trie 树（每条边一个字符），Radix Tree 的每个节点可以存储一段 Token 序列（key），
+    从而压缩路径，减少深度。
+
+    属性:
+    - _key: 该节点存储的 Token ID 序列片段 (e.g., [TokenA, TokenB])
+    - _value: 对应的 KV Cache 物理显存索引 (e.g., [Page1, Page2])
+    - children: 子节点映射 {First_Token_ID -> Node}
+    - ref_count: 引用计数。表示当前有多少个活跃请求正在依赖该节点的数据。
+                 ref_count > 0 时，该节点是受保护的 (Protected)，不可被驱逐。
+    - timestamp: 最后访问时间戳，用于 LRU (Least Recently Used) 驱逐策略。
     """
     counter: int = 0
 
     def __init__(self, tic: int | None = None) -> None:
         self.children: Dict[int, RadixTreeNode] = {} # 子节点 Map (Key: Token ID)
         self._parent: RadixTreeNode | None = None
-        self.ref_count: int = 0  # 引用计数 (有多少个请求正在使用该节点)
+        self.ref_count: int = 0  
         self.uuid = RadixTreeNode.counter
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns() # LRU 时间戳
@@ -65,7 +76,7 @@ class RadixTreeNode:
     def get_match_len(self, input_ids: torch.Tensor) -> int:
         """
         计算输入序列与当前节点 Key 的最大匹配长度。
-        使用 C++ 优化的 fast_compare_key。
+        使用 C++ 优化的 fast_compare_key 进行快速比对。
         """
         from minisgl.kernel import fast_compare_key
         return fast_compare_key(self._key, input_ids)
@@ -74,25 +85,43 @@ class RadixTreeNode:
         """
         在指定位置分裂当前节点。
         当只有部分前缀匹配时使用。
-        例如：Node(ABC) -> Split(1) -> Node(A) -> Node(BC)
+        
+        示例:
+        当前节点 Key: [A, B, C]
+        输入序列: [A, B, D]
+        
+        操作:
+        1. 在位置 2 (Token C 处) 分裂。
+        2. 原节点变为父节点 Key: [A, B]
+        3. 新创建子节点 Key: [C], 继承原有的 children 和 value。
+        4. 输入序列后续会挂在父节点 [A, B] 下面，形成新的分支 [D]。
+        
+        Args:
+            pos: 分裂点的位置索引
+        Returns:
+            new_node: 分裂出来的父节点（原节点变成了子节点）-- 等等，根据代码看逻辑是：
+            代码逻辑是：
+            1. 创建 new_node 作为父节点 (Key: 0~pos)
+            2. 将 self (当前节点) 修改为子节点 (Key: pos~end)
+            3. 返回 new_node
         """
         assert 0 < pos < self.length
         parent = self.parent
 
-        # 创建前半部分的新节点
+        # 创建前半部分的新节点 (作为新的父节点)
         new_node = RadixTreeNode(self.timestamp)
         new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
-        new_node.ref_count = self.ref_count
+        new_node.ref_count = self.ref_count # 继承引用计数
 
-        # 将当前节点更新为后半部分
+        # 将当前节点更新为后半部分 (作为子节点)
         self.set_key_value(self._key[pos:], self._value[pos:])
         self.set_parent(new_node)
 
         return new_node
 
     def __lt__(self, other: RadixTreeNode) -> bool:
-        # 用于 heapq 比较 (按时间戳)
+        # 用于 heapq 比较 (按时间戳)，决定谁先被 LRU 驱逐
         return self.timestamp < other.timestamp
 
 
@@ -105,21 +134,29 @@ class RadixCacheHandle(BaseCacheHandle):
 class RadixCacheManager(BaseCacheManager):
     """
     基于 Radix Tree 的 KV Cache 管理器。
-    实现了 Prefix Caching (前缀缓存) 机制，允许不同请求共享相同的 Prompt 前缀缓存。
+    
+    核心功能：
+    1. **前缀复用**: 自动识别不同请求的公共前缀 (如 System Prompt)，复用显存。
+    2. **动态管理**: 随请求生成动态插入新节点，随显存压力动态驱逐旧节点。
+    3. **LRU 策略**: 维护 LRU 堆，优先回收最久未使用的缓存。
     """
     def __init__(self, device: torch.device):
         self.device = device
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         super().__init__()
         self.root_node = RadixTreeNode()
-        self.root_node.ref_count = 1  # 根节点始终受保护
-        self.evictable_size = 0 # 可驱逐的总 Token 数
-        self.protected_size = 0 # 受保护（正在使用）的总 Token 数
+        self.root_node.ref_count = 1  # 根节点始终受保护，不可删除
+        self.evictable_size = 0 # 可驱逐的总 Token 数 (ref_count=0 的节点总长)
+        self.protected_size = 0 # 受保护的总 Token 数 (ref_count>0 的节点总长)
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         """
         锁定/解锁句柄。
-        锁定会增加引用计数，防止节点被 LRU 驱逐。
+        
+        逻辑:
+        从目标节点回溯到根节点，沿途更新所有父节点的引用计数。
+        - 只要有一个子节点被引用，其所有父节点也必须被保护 (ref_count > 0)。
+        - 只有当 ref_count 降为 0 时，显存大小才从 protected 转移到 evictable。
         """
         assert isinstance(handle, RadixCacheHandle)
         node = handle.node
@@ -141,12 +178,12 @@ class RadixCacheManager(BaseCacheManager):
 
     def match_prefix(self, input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, torch.Tensor]:
         """
-        匹配最长前缀。
-        Args:
-            input_ids: 输入 Token 序列
-        Returns:
-            handle: 匹配到的最末端节点的句柄
-            indices: 匹配路径上所有节点对应的 Cache 索引拼接成的 Tensor
+        在 Radix Tree 中查找输入 Token 序列的最长匹配前缀。
+        
+        流程:
+        1. 调用 _walk 找到最后匹配的节点和长度。
+        2. 回溯路径，收集所有父节点的 value (物理索引)。
+        3. 拼接所有物理索引返回。
         """
         node, prefix_len = self._walk(input_ids)
         if prefix_len == 0:
@@ -163,11 +200,19 @@ class RadixCacheManager(BaseCacheManager):
         return RadixCacheHandle(prefix_len, matched_node), torch.cat(value_list)
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> int:
-        """插入新的前缀到树中"""
+        """
+        将新生成的 KV Cache 索引插入树中。
+        
+        场景:
+        当请求进行 Prefill 或 Decode 后，会产生新的 KV 数据。
+        我们需要将这些新数据的物理索引记录到树中，以便未来复用。
+        """
         node, prefix_len = self._walk(input_ids)
         assert prefix_len <= len(input_ids)
+        
         if prefix_len < len(input_ids):
-            # 如果有未匹配的部分，创建新节点挂载
+            # 如果有未匹配的部分，创建新节点挂载到最后匹配的节点下
+            # 新节点存储 input_ids[prefix_len:] 和 indices[prefix_len:]
             new_node = RadixTreeNode()
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:])
             new_node.set_parent(node)
@@ -175,7 +220,14 @@ class RadixCacheManager(BaseCacheManager):
         return prefix_len
 
     def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
-        """在树上行走，寻找最长匹配路径"""
+        """
+        在树上行走，寻找最长匹配路径。
+        这是 Radix Tree 的核心查找逻辑。
+        
+        Returns:
+            node: 最后匹配到的节点 (可能是完全匹配，也可能是部分匹配需分裂)
+            prefix_len: 匹配的总长度
+        """
         prefix_len = 0
         indice_len = len(input_ids)
         node = self.root_node
@@ -188,11 +240,12 @@ class RadixCacheManager(BaseCacheManager):
 
             node = node.children[this_id]
 
-            # 比较当前节点的 key
+            # 比较当前节点的 key 与剩余 input_ids
             match_len = node.get_match_len(input_ids[prefix_len:])
             prefix_len += match_len
 
-            # 如果没有完全匹配当前节点，说明需要分裂
+            # 如果没有完全匹配当前节点 (match_len < node.length)，说明遇到了分叉点
+            # 需要对当前节点进行分裂 (Split)，以便插入新的分支
             if match_len != node.length:
                 node = node._split_at(match_len)
                 return node, prefix_len
@@ -204,11 +257,13 @@ class RadixCacheManager(BaseCacheManager):
 
     def evict(self, size: int) -> torch.Tensor:
         """
-        驱逐最久未使用的节点以释放显存。
-        Args:
-            size: 需要释放的 Token 数量
-        Returns:
-            释放的物理 Cache 索引
+        驱逐最久未使用的节点以释放显存 (LRU)。
+        
+        流程:
+        1. 收集所有 ref_count=0 的叶子节点。
+        2. 构建小顶堆 (按 timestamp 排序)。
+        3. 循环弹出最老的节点，回收其物理索引，直到满足释放大小。
+        4. 如果删除节点导致父节点变成了新的空闲叶子，将父节点加入堆中 (级联删除)。
         """
         if size == 0:
             return self.empty_tensor

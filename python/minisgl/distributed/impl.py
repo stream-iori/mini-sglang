@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 @dataclass
 class DistributedImpl(ABC):
     """分布式通信实现的抽象基类"""
+
     @abstractmethod
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor: ...
 
@@ -27,6 +28,7 @@ class TorchDistributedImpl(DistributedImpl):
     """
     基于 PyTorch 原生 `torch.distributed` (NCCL/Gloo) 的通信实现。
     """
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = dist.get_world_size()
         if tp_size == 1:
@@ -51,6 +53,7 @@ class PyNCCLDistributedImpl(DistributedImpl):
     基于自定义 PyNCCL 绑定库的通信实现。
     通常比 PyTorch 原生的更快，或者提供特定的优化。
     """
+
     comm: PyNCCLCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -73,6 +76,7 @@ class DistributedCommunicator:
     分布式通信器管理器。
     使用插件机制管理当前的通信后端（Torch 或 PyNCCL）。
     """
+
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,7 +93,6 @@ def enable_pynccl_distributed(
 ) -> None:
     """
     启用 PyNCCL 作为分布式通信后端。
-    
     Args:
         tp_info: 分布式信息
         tp_cpu_group: PyTorch CPU 进程组（用于 bootstrap）
@@ -116,3 +119,4 @@ def destroy_distributed() -> None:
     销毁所有分布式通信插件。
     """
     DistributedCommunicator.plugins = []
+

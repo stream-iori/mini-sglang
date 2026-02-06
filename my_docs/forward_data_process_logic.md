@@ -179,3 +179,40 @@ self.cache_manager.free_and_cache_finished_req(...)
 ```
 
 Instead of simply discarding the KV cache, the system attempts to insert the token sequence into the `RadixCache`. This allows future requests with the same prefix to reuse the computed KV states (Prefix Caching).
+
+---
+
+## 3. Model Integration: The Lifecycle of Token IDs (Example: Qwen)
+
+The efficiency of Mini-SGLang comes from how `ForwardData` structures are consumed by the model architecture without unnecessary data movement. Using **Qwen3** as an example, here is the lifecycle:
+
+### 3.1 Data Consumption (The "Pull" Model)
+
+The model does not "receive" arguments in the traditional sense. Instead, it "pulls" what it needs from the **Global Context** established by the `Engine`.
+
+1.  **Input IDs**: `Qwen3ForCausalLM.forward()` calls `get_global_ctx().batch.input_ids`. This is the flattened 1D tensor prepared by the Scheduler using `load_indices`.
+2.  **Attention Metadata**: Inside `AttentionLayer.forward()`, the model retrieves `metadata = ctx.batch.attn_metadata`. This contains `positions` for RoPE and block tables for PagedAttention.
+
+### 3.2 Computational Steps
+
+| Component | Action | Role of ForwardData |
+| :--- | :--- | :--- |
+| **Embedding** | `VocabParallelEmbedding` | Maps `input_ids` to hidden states. |
+| **Rotary (RoPE)** | `get_rope().forward()` | Uses `metadata.positions` to rotate Q and K vectors. |
+| **Attention** | `attn_backend.forward()` | Uses `batch.out_loc` to write new K/V values into the global KV pool at the exact physical indices allocated by the Scheduler. |
+| **LM Head** | `ParallelLMHead` | Computes Logits. **Optimization**: For Prefill, it only computes Logits for the last token of each sequence (using `attn_metadata.get_last_indices`). |
+
+### 3.3 Result Generation (Sampling)
+
+Once `model.forward()` returns the raw Logits, the `Engine` takes over:
+
+1.  **Slicing**: The Engine slices the Logits tensor to include only the relevant tokens (one per request).
+2.  **Sampling**: The `Sampler` uses `BatchSamplingArgs` (from `ForwardInput`) to perform Top-P/Top-K/Temperature sampling on the GPU.
+3.  **Output Packaging**: The resulting `next_tokens_gpu` and its CPU clone `next_tokens_cpu` are wrapped into a `ForwardOutput` object.
+
+### 3.4 Closing the Loop
+
+The Scheduler then calls `_write_token_ids(input, output)`, which executes:
+`token_pool.view(-1)[input.write_indices] = output.next_tokens_gpu`
+
+This ensures that the GPU-resident "Source of Truth" (`token_pool`) is updated for the next iteration, while the CPU-resident `next_tokens_cpu` is used in `_process_last_data` to inform the user and update the `Req` objects.

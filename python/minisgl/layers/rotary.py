@@ -10,6 +10,16 @@ from .base import StateLessOP
 
 
 class RotaryEmbedding(StateLessOP):
+    """
+    Rotary Position Embedding (RoPE).
+    
+    RoPE 是一种相对位置编码方法，通过将 Token 的 Query 和 Key 向量在复平面上旋转
+    一定的角度来注入位置信息。旋转的角度取决于 Token 在序列中的绝对位置。
+    
+    优点:
+    - 能够自然地处理相对位置关系。
+    - 具有良好的外推性 (Extrapolation)，即可以处理比训练时更长的序列。
+    """
     def __init__(
         self,
         head_size: int,
@@ -21,14 +31,28 @@ class RotaryEmbedding(StateLessOP):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
+        
+        # 预计算频率 (Inverse Frequency)
+        # theta_i = 10000 ^ (-2(i-1)/d)
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        
+        # 可选的后处理 (例如用于 Llama 3 的 scaling)
         if post_process is not None:
             inv_freq = post_process(inv_freq)
+            
+        # 生成位置索引 [0, 1, ..., max_pos-1]
         t = torch.arange(max_position_embeddings, dtype=torch.float)
+        
+        # 外积计算所有位置在所有频率上的角度: m * theta_i
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        
+        # 计算 cos 和 sin
         cos = freqs.cos()
         sin = freqs.sin()
-        # buffer, so don't load/save
+        
+        # 缓存 cos/sin 表，避免每次 forward 重复计算
+        # 形状: [max_pos, rotary_dim] (cat 后 dim 翻倍? 不，这里是 cat(cos, sin) dim=-1，如果是 interleave 可能会不同，需看具体实现)
+        # 这里的实现是将 cos 和 sin 拼接到一起，供 FlashInfer Kernel 使用
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
@@ -45,8 +69,16 @@ class RotaryEmbedding(StateLessOP):
         k: torch.Tensor,
         offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        应用 RoPE 到 q 和 k 上。
+        
+        Args:
+            positions: 每个 Token 的位置索引 [batch_tokens]
+            q: Query 向量
+            k: Key 向量
+        """
         if q.device.type == "cpu":
-            # Naive CPU implementation
+            # Naive CPU implementation (用于调试)
             dim = self.rotary_dim
             inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
             t = positions.float()
@@ -73,6 +105,7 @@ class RotaryEmbedding(StateLessOP):
                 
             return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         else:
+            # 使用 FlashInfer Kernel 进行高性能计算
             from flashinfer import apply_rope_with_cos_sin_cache_inplace
 
             self.cos_sin_cache = self.cos_sin_cache.to(q.device)
@@ -89,9 +122,11 @@ def _get_rope(
     base: float,
     rope_scaling: Dict[str, Any] | None = None,
 ) -> RotaryEmbedding:
+    """内部工厂函数，处理 Scaling 逻辑"""
     if rope_scaling is None:
         return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
-    # need to test some cases:
+    
+    # Llama 3 特有的 RoPE Scaling 策略
     match rope_scaling["rope_type"]:
         case "llama3":
             scaling_factor: float = rope_scaling["factor"]
@@ -100,6 +135,10 @@ def _get_rope(
             original_max_position: int = rope_scaling["original_max_position_embeddings"]
 
             def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
+                """
+                Llama 3 Scaling 逻辑:
+                对不同频段的波长应用不同的缩放因子，以更好地支持长上下文。
+                """
                 # no smooth if low_freq_factor == high_freq_factor
                 wave_len = 2 * math.pi / inv_freq
                 if low_freq_factor == high_freq_factor:
@@ -124,6 +163,7 @@ _ROPE_DEVICE: torch.device | None = None
 
 
 def set_rope_device(device: torch.device):
+    """设置 RoPE 的默认设备 (用于缓存管理)"""
     global _ROPE_DEVICE
     _ROPE_DEVICE = device
 
@@ -136,6 +176,10 @@ def get_rope(
     base: float,
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
 ) -> RotaryEmbedding:
+    """
+    获取 RotaryEmbedding 实例的公共接口。
+    使用 lru_cache 缓存实例，避免重复创建相同的 RoPE 对象。
+    """
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
     if t.device == torch.device("meta"):

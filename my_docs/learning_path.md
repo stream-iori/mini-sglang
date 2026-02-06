@@ -54,6 +54,8 @@ Goal: Understand how the system manages resources and decides what to compute ne
 - **Focus**:
   - `Scheduler` class.
   - `overlap_loop()`: This is the heart of the system. It overlaps CPU work (scheduling, signal processing) with GPU work (model execution).
+  - `_forward()`: The core execution step (see [Scheduler Forward Logic](scheduler_forward_logic.md)).
+  - **Continuous Batching**: See [Continuous Batching Logic](continuous_batching_logic.md) for details on iteration-level scheduling.
   - `run_forever()`: The main event loop.
   - `_process_one_msg()`: Handling new requests.
 
@@ -73,6 +75,7 @@ Goal: Understand how the model is actually executed on the GPU.
 ### 1. The Engine
 
 - **File**: `python/minisgl/engine/engine.py`
+- **Documentation**: `my_docs/engine_architecture.md` (Deep dive into initialization and execution)
 - **Focus**:
   - `Engine` class initialization: Loading models, allocating memory.
   - `forward_batch()`: The function that calls the model.
