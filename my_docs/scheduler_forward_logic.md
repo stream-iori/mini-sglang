@@ -23,7 +23,7 @@
 - **`next_tokens_cpu`**: 异步拷贝到 CPU 的 Token ID 列表 (用于 Scheduler 逻辑判断，如 EOS 检查)。
 - **`copy_done_event`**: CUDA Event，用于同步 GPU->CPU 的拷贝操作。
 
-### 1.3 `token_pool` (2D Tensor)
+### 0.3 `token_pool` (2D Tensor)
 
 `TableManager` 管理的一个大张量，存储了所有活跃请求的 Token ID 历史。
 
